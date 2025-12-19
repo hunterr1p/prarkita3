@@ -1,0 +1,519 @@
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import LabelEncoder
+import tensorflow as tf
+from tensorflow import keras
+from tensorflow.keras import layers, Model
+import warnings
+warnings.filterwarnings('ignore')
+
+ratings = pd.read_csv('rating.csv')
+movies = pd.read_csv('movie.csv')
+
+print("=" * 60)
+print("ДАТАСЕТ MOVIELENS 25M - АНАЛИЗ")
+print("=" * 60)
+
+print("\n📊 Ratings данные:")
+print(ratings.head())
+print(f"\nФорма ratings: {ratings.shape}")
+print(f"Уникальных пользователей: {ratings['userId'].nunique():,}")
+print(f"Уникальных фильмов: {ratings['movieId'].nunique():,}")
+print(f"Всего оценок: {len(ratings):,}")
+
+print("\n🎬 Movies данные:")
+print(movies.head())
+print(f"\nУникальных жанров: {movies['genres'].str.split('|').explode().nunique()}")
+
+# Анализ разреженности
+num_users = ratings['userId'].nunique()
+num_movies = ratings['movieId'].nunique()
+total_possible = num_users * num_movies
+sparsity = (1 - len(ratings) / total_possible) * 100
+
+print(f"\n📈 Разреженность матрицы:")
+print(f"Пользователи × Фильмы = {num_users:,} × {num_movies:,} = {total_possible:,} возможных оценок")
+print(f"Фактических оценок: {len(ratings):,}")
+print(f"Разреженность: {sparsity:.4f}%")
+
+# Визуализация распределения оценок
+plt.figure(figsize=(15, 5))
+
+plt.subplot(1, 3, 1)
+ratings['rating'].hist(bins=50, edgecolor='black', alpha=0.7)
+plt.title('Распределение оценок', fontsize=12)
+plt.xlabel('Оценка')
+plt.ylabel('Частота')
+
+plt.subplot(1, 3, 2)
+ratings_per_user = ratings.groupby('userId')['rating'].count()
+ratings_per_user.hist(bins=50, edgecolor='black', alpha=0.7, log=True)
+plt.title('Оценок на пользователя (log scale)', fontsize=12)
+plt.xlabel('Количество оценок')
+plt.ylabel('Частота (log)')
+
+plt.subplot(1, 3, 3)
+ratings_per_movie = ratings.groupby('movieId')['rating'].count()
+ratings_per_movie.hist(bins=50, edgecolor='black', alpha=0.7, log=True)
+plt.title('Оценок на фильм (log scale)', fontsize=12)
+plt.xlabel('Количество оценок')
+plt.ylabel('Частота (log)')
+
+plt.tight_layout()
+plt.show()
+print("=" * 60)
+print("ПОДГОТОВКА ДАННЫХ ДЛЯ НЕЙРОСЕТИ")
+print("=" * 60)
+
+# Для скорости возьмем подмножество (можно увеличить для лучшего качества)
+SAMPLE_SIZE = 200000  # Увеличьте до 1-2 миллионов для production-качества
+print(f"Используем выборку из {SAMPLE_SIZE:,} оценок")
+
+ratings_sample = ratings.sample(n=SAMPLE_SIZE, random_state=42)
+
+# Закодируем пользователей и фильмы в последовательные индексы
+user_encoder = LabelEncoder()
+movie_encoder = LabelEncoder()
+
+ratings_sample['user_idx'] = user_encoder.fit_transform(ratings_sample['userId'])
+ratings_sample['movie_idx'] = movie_encoder.fit_transform(ratings_sample['movieId'])
+
+num_users_encoded = len(user_encoder.classes_)
+num_movies_encoded = len(movie_encoder.classes_)
+
+print(f"\nПосле кодирования:")
+print(f"Уникальных пользователей: {num_users_encoded}")
+print(f"Уникальных фильмов: {num_movies_encoded}")
+
+# Разделим на train/test
+train, test = train_test_split(
+    ratings_sample[['user_idx', 'movie_idx', 'rating']],
+    test_size=0.2,
+    random_state=42
+)
+
+print(f"\nРазделение данных:")
+print(f"Обучающая выборка: {len(train):,} записей")
+print(f"Тестовая выборка: {len(test):,} записей")
+
+# Нормализуем оценки (от 0.5-5.0 к 0-1)
+rating_min, rating_max = 0.5, 5.0
+train['rating_norm'] = (train['rating'] - rating_min) / (rating_max - rating_min)
+test['rating_norm'] = (test['rating'] - rating_min) / (rating_max - rating_min)
+
+print(f"\nНормализация оценок:")
+print(f"Исходный диапазон: {rating_min}-{rating_max}")
+print(f"Нормализованный диапазон: {train['rating_norm'].min():.2f}-{train['rating_norm'].max():.2f}")
+print("=" * 60)
+print("ПОСТРОЕНИЕ НЕЙРОСЕТЕВОЙ МОДЕЛИ")
+print("=" * 60)
+
+# Параметры модели
+EMBEDDING_SIZE = 50
+DROPOUT_RATE = 0.3
+LEARNING_RATE = 0.001
+
+def build_neural_cf_model(num_users, num_movies, embedding_size=EMBEDDING_SIZE):
+    """
+    Нейросетевая модель коллаборативной фильтрации
+    Architecture: Embedding -> Flatten -> Concatenate -> Dense -> Output
+    """
+    # Входные слои
+    user_input = layers.Input(shape=(1,), name='user_input')
+    movie_input = layers.Input(shape=(1,), name='movie_input')
+
+    # Эмбеддинг слои
+    user_embedding = layers.Embedding(
+        input_dim=num_users,
+        output_dim=embedding_size,
+        name='user_embedding'
+    )(user_input)
+
+    movie_embedding = layers.Embedding(
+        input_dim=num_movies,
+        output_dim=embedding_size,
+        name='movie_embedding'
+    )(movie_input)
+
+    # Преобразуем в векторы
+    user_vector = layers.Flatten()(user_embedding)
+    movie_vector = layers.Flatten()(movie_embedding)
+
+    # Конкатенируем векторы
+    concatenated = layers.Concatenate()([user_vector, movie_vector])
+
+    # Полносвязные слои
+    dense = layers.Dense(128, activation='relu')(concatenated)
+    dropout = layers.Dropout(DROPOUT_RATE)(dense)
+    dense2 = layers.Dense(64, activation='relu')(dropout)
+    dropout2 = layers.Dropout(DROPOUT_RATE)(dense2)
+    dense3 = layers.Dense(32, activation='relu')(dropout2)
+
+    # Выходной слой (предсказание оценки 0-1)
+    output = layers.Dense(1, activation='sigmoid', name='rating_output')(dense3)
+
+    # Собираем модель
+    model = Model(inputs=[user_input, movie_input], outputs=output)
+
+    return model
+
+# Создаем модель
+model = build_neural_cf_model(num_users_encoded, num_movies_encoded)
+model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=LEARNING_RATE),
+    loss='mse',  # Mean Squared Error для регрессии
+    metrics=['mae', 'mse']  # Mean Absolute Error и MSE
+)
+
+print("Архитектура модели:")
+model.summary()
+
+# Визуализируем архитектуру
+keras.utils.plot_model(
+    model,
+    to_file='model_architecture.png',
+    show_shapes=True,
+    show_layer_names=True
+)
+print("\n✅ Архитектура модели сохранена в 'model_architecture.png'")
+print("=" * 60)
+print("ОБУЧЕНИЕ МОДЕЛИ")
+print("=" * 60)
+
+# Подготовка данных для обучения
+train_user_data = train['user_idx'].values
+train_movie_data = train['movie_idx'].values
+train_ratings = train['rating_norm'].values
+
+test_user_data = test['user_idx'].values
+test_movie_data = test['movie_idx'].values
+test_ratings = test['rating_norm'].values
+
+# Callback'и для обучения
+early_stopping = keras.callbacks.EarlyStopping(
+    monitor='val_loss',
+    patience=5,
+    restore_best_weights=True,
+    verbose=1
+)
+
+reduce_lr = keras.callbacks.ReduceLROnPlateau(
+    monitor='val_loss',
+    factor=0.5,
+    patience=3,
+    min_lr=0.00001,
+    verbose=1
+)
+
+# Обучение модели
+history = model.fit(
+    x=[train_user_data, train_movie_data],
+    y=train_ratings,
+    batch_size=256,
+    epochs=30,
+    validation_split=0.1,
+    callbacks=[early_stopping, reduce_lr],
+    verbose=1
+)
+
+# Визуализация процесса обучения
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 2, 1)
+plt.plot(history.history['loss'], label='Обучающая')
+plt.plot(history.history['val_loss'], label='Валидационная')
+plt.title('Функция потерь (MSE)')
+plt.xlabel('Эпоха')
+plt.ylabel('Потери')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.plot(history.history['mae'], label='Обучающая')
+plt.plot(history.history['val_mae'], label='Валидационная')
+plt.title('Средняя абсолютная ошибка (MAE)')
+plt.xlabel('Эпоха')
+plt.ylabel('MAE')
+plt.legend()
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+print("=" * 60)
+print("ОЦЕНКА МОДЕЛИ И РЕКОМЕНДАЦИИ")
+print("=" * 60)
+
+# Оценка на тестовых данных
+test_loss, test_mae, test_mse = model.evaluate(
+    [test_user_data, test_movie_data],
+    test_ratings,
+    verbose=0
+)
+
+# Конвертируем обратно в исходный масштаб оценок
+test_mae_original = test_mae * (rating_max - rating_min)
+test_rmse_original = np.sqrt(test_mse) * (rating_max - rating_min)
+
+print(f"\n📊 Результаты на тестовой выборке:")
+print(f"MAE (нормализованный): {test_mae:.4f}")
+print(f"MAE (в исходном масштабе 0.5-5.0): {test_mae_original:.4f}")
+print(f"RMSE (в исходном масштабе): {test_rmse_original:.4f}")
+
+# Функция для получения рекомендаций
+def get_recommendations(user_id, top_n=10, exclude_rated=True):
+    """
+    Получает рекомендации для конкретного пользователя
+    """
+    # Получаем индекс пользователя
+    user_idx = user_encoder.transform([user_id])[0]
+
+    # Все фильмы
+    all_movie_indices = np.arange(num_movies_encoded)
+    user_indices = np.full(num_movies_encoded, user_idx)
+
+    # Предсказываем оценки для всех фильмов
+    predictions = model.predict(
+        [user_indices, all_movie_indices],
+        batch_size=1024,
+        verbose=0
+    ).flatten()
+
+    # Получаем оригинальные movieId
+    original_movie_ids = movie_encoder.inverse_transform(all_movie_indices)
+
+    # Создаем DataFrame с результатами
+    recommendations = pd.DataFrame({
+        'movieId': original_movie_ids,
+        'predicted_rating': predictions * (rating_max - rating_min) + rating_min
+    })
+
+    # Добавляем информацию о фильмах
+    recommendations = recommendations.merge(movies, on='movieId')
+
+    # Исключаем уже оцененные пользователем фильмы
+    if exclude_rated:
+        rated_movies = ratings[ratings['userId'] == user_id]['movieId'].tolist()
+        recommendations = recommendations[~recommendations['movieId'].isin(rated_movies)]
+
+    # Сортируем по предсказанной оценке
+    recommendations = recommendations.sort_values('predicted_rating', ascending=False)
+
+    return recommendations.head(top_n)
+
+# Функция для похожих фильмов на основе эмбеддингов
+def get_similar_movies(movie_id, top_n=10):
+    """
+    Находит похожие фильмы на основе векторных представлений (эмбеддингов)
+    """
+    movie_idx = movie_encoder.transform([movie_id])[0]
+
+    # Получаем эмбеддинг слои
+    movie_embedding_layer = model.get_layer('movie_embedding')
+    movie_embeddings = movie_embedding_layer.get_weights()[0]
+
+    # Вычисляем косинусное сходство
+    target_embedding = movie_embeddings[movie_idx].reshape(1, -1)
+    similarities = np.dot(movie_embeddings, target_embedding.T).flatten()
+
+    # Получаем топ-N похожих фильмов (исключая сам фильм)
+    similar_indices = similarities.argsort()[-(top_n+1):-1][::-1]
+    similar_movie_ids = movie_encoder.inverse_transform(similar_indices)
+
+    # Создаем результат
+    similar_movies = pd.DataFrame({
+        'movieId': similar_movie_ids,
+        'similarity': similarities[similar_indices]
+    }).merge(movies, on='movieId')
+
+    return similar_movies
+
+# Тестируем на примере пользователя
+print("\n🎯 Пример рекомендаций для пользователя #1:")
+user_id_example = 1  # Можно изменить на любого пользователя
+
+try:
+    recommendations = get_recommendations(user_id_example, top_n=5)
+    print(f"\nТоп-5 рекомендаций для пользователя {user_id_example}:")
+    for i, row in recommendations.iterrows():
+        print(f"{i+1}. {row['title']} | Предсказанная оценка: {row['predicted_rating']:.2f} | Жанры: {row['genres']}")
+except Exception as e:
+    print(f"Пользователь {user_id_example} не найден в выборке. Попробуйте другого.")
+
+# Пример поиска похожих фильмов
+print("\n🔍 Пример поиска похожих фильмов:")
+# Найдем ID фильма "Toy Story" (1995)
+toy_story = movies[movies['title'].str.contains('Toy Story') & movies['title'].str.contains('1995')]
+if not toy_story.empty:
+    toy_story_id = toy_story.iloc[0]['movieId']
+    print(f"Находим фильмы, похожие на: {toy_story.iloc[0]['title']}")
+
+    similar = get_similar_movies(toy_story_id, top_n=5)
+    for i, row in similar.iterrows():
+        print(f"{i+1}. {row['title']} | Сходство: {row['similarity']:.3f}")
+else:
+    print("Фильм 'Toy Story' не найден в базе")
+
+# Массовая оценка для нескольких пользователей
+print("\n📋 Массовая оценка рекомендаций:")
+sample_users = ratings['userId'].drop_duplicates().sample(3, random_state=42).tolist()
+
+for user in sample_users:
+    try:
+        recs = get_recommendations(user, top_n=3)
+        print(f"\nПользователь {user}:")
+        for _, row in recs.iterrows():
+            print(f"  • {row['title'][:50]}... ({row['predicted_rating']:.2f})")
+    except:
+        print(f"Пользователь {user} не найден в кодировке")
+print("=" * 60)
+print("УЛУЧШЕННАЯ МОДЕЛЬ: NEURAL COLLABORATIVE FILTERING")
+print("=" * 60)
+
+def build_ncf_model(num_users, num_movies, embedding_size=50):
+    """
+    Улучшенная модель Neural Collaborative Filtering
+    Комбинирует матричную факторизацию и многослойный перцептрон
+    """
+    # Входные слои
+    user_input = layers.Input(shape=(1,), name='user_input')
+    movie_input = layers.Input(shape=(1,), name='movie_input')
+
+    # Эмбеддинги для матричной факторизации (GMF)
+    user_embedding_mf = layers.Embedding(num_users, embedding_size, name='user_embedding_mf')(user_input)
+    movie_embedding_mf = layers.Embedding(num_movies, embedding_size, name='movie_embedding_mf')(movie_input)
+
+    # Эмбеддинги для MLP
+    user_embedding_mlp = layers.Embedding(num_users, embedding_size*2, name='user_embedding_mlp')(user_input)
+    movie_embedding_mlp = layers.Embedding(num_movies, embedding_size*2, name='movie_embedding_mlp')(movie_input)
+
+    # GMF путь: element-wise произведение
+    user_vec_mf = layers.Flatten()(user_embedding_mf)
+    movie_vec_mf = layers.Flatten()(movie_embedding_mf)
+    mf_vector = layers.Multiply()([user_vec_mf, movie_vec_mf])
+
+    # MLP путь
+    user_vec_mlp = layers.Flatten()(user_embedding_mlp)
+    movie_vec_mlp = layers.Flatten()(movie_embedding_mlp)
+    mlp_vector = layers.Concatenate()([user_vec_mlp, movie_vec_mlp])
+
+    # MLP слои
+    mlp_vector = layers.Dense(128, activation='relu')(mlp_vector)
+    mlp_vector = layers.Dropout(0.3)(mlp_vector)
+    mlp_vector = layers.Dense(64, activation='relu')(mlp_vector)
+    mlp_vector = layers.Dropout(0.2)(mlp_vector)
+    mlp_vector = layers.Dense(32, activation='relu')(mlp_vector)
+
+    # Конкатенируем GMF и MLP
+    concatenated = layers.Concatenate()([mf_vector, mlp_vector])
+
+    # Финальные слои
+    output = layers.Dense(16, activation='relu')(concatenated)
+    output = layers.Dropout(0.1)(output)
+    output = layers.Dense(1, activation='sigmoid', name='output')(output)
+
+    model = Model(inputs=[user_input, movie_input], outputs=output)
+
+    return model
+
+# Создаем и обучаем улучшенную модель
+print("\nСоздаем улучшенную NCF модель...")
+ncf_model = build_ncf_model(num_users_encoded, num_movies_encoded, embedding_size=32)
+ncf_model.compile(
+    optimizer=keras.optimizers.Adam(learning_rate=0.001),
+    loss='mse',
+    metrics=['mae']
+)
+
+ncf_model.summary()
+
+# Быстрое обучение на небольшом числе эпох
+print("\nБыстрое обучение NCF модели (5 эпох)...")
+ncf_history = ncf_model.fit(
+    [train_user_data, train_movie_data],
+    train_ratings,
+    batch_size=512,
+    epochs=5,
+    validation_split=0.1,
+    verbose=1
+)
+
+# Сравнение моделей
+print("\n📊 СРАВНЕНИЕ МОДЕЛЕЙ:")
+print("-" * 40)
+print("Базовая модель vs NCF модель")
+print("(чем ниже метрики, тем лучше)")
+
+# Предсказания базовой модели
+base_pred = model.predict([test_user_data[:1000], test_movie_data[:1000]]).flatten()
+base_pred = base_pred * (rating_max - rating_min) + rating_min
+base_mae = np.mean(np.abs(base_pred - test['rating'].values[:1000]))
+
+# Предсказания NCF модели
+ncf_pred = ncf_model.predict([test_user_data[:1000], test_movie_data[:1000]]).flatten()
+ncf_pred = ncf_pred * (rating_max - rating_min) + rating_min
+ncf_mae = np.mean(np.abs(ncf_pred - test['rating'].values[:1000]))
+
+print(f"\nMAE на 1000 тестовых примерах:")
+print(f"  Базовая модель: {base_mae:.4f}")
+print(f"  NCF модель: {ncf_mae:.4f}")
+
+# Визуализация сравнения
+plt.figure(figsize=(10, 4))
+
+plt.subplot(1, 2, 1)
+plt.scatter(test['rating'].values[:100], base_pred[:100], alpha=0.5)
+plt.plot([0.5, 5], [0.5, 5], 'r--', alpha=0.5)
+plt.title('Базовая модель: Факт vs Прогноз')
+plt.xlabel('Фактическая оценка')
+plt.ylabel('Предсказанная оценка')
+plt.grid(True, alpha=0.3)
+
+plt.subplot(1, 2, 2)
+plt.scatter(test['rating'].values[:100], ncf_pred[:100], alpha=0.5)
+plt.plot([0.5, 5], [0.5, 5], 'r--', alpha=0.5)
+plt.title('NCF модель: Факт vs Прогноз')
+plt.xlabel('Фактическая оценка')
+plt.ylabel('Предсказанная оценка')
+plt.grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.show()
+print("=" * 60)
+print("СОХРАНЕНИЕ МОДЕЛИ И РЕЗУЛЬТАТОВ")
+print("=" * 60)
+
+# Сохраняем модель
+model.save('neural_cf_recommender.h5')
+print("✅ Модель сохранена как 'neural_cf_recommender.h5'")
+
+# Сохраняем кодировщики
+import pickle
+with open('user_encoder.pkl', 'wb') as f:
+    pickle.dump(user_encoder, f)
+with open('movie_encoder.pkl', 'wb') as f:
+    pickle.dump(movie_encoder, f)
+print("✅ Кодировщики сохранены")
+
+# Сохраняем примеры рекомендаций
+sample_recommendations = []
+for user_id in ratings['userId'].unique()[:10]:  # Для 10 пользователей
+    try:
+        recs = get_recommendations(user_id, top_n=3)
+        for _, row in recs.iterrows():
+            sample_recommendations.append({
+                'user_id': user_id,
+                'movie_id': row['movieId'],
+                'title': row['title'],
+                'predicted_rating': row['predicted_rating'],
+                'genres': row['genres']
+            })
+    except:
+        continue
+
+recs_df = pd.DataFrame(sample_recommendations)
+recs_df.to_csv('sample_recommendations.csv', index=False)
+print(f"✅ Примеры рекомендаций сохранены в 'sample_recommendations.csv' ({len(recs_df)} записей)")
+print(f"Качество модели (MAE): {test_mae_original:.3f} (в шкале 0.5-5.0)")
